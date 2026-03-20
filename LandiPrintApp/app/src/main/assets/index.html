@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Landi Print Test</title>
+</head>
+<body>
+    <h1>Landi C20 Printer Test</h1>
+    <button onclick="printOnLandiPrinter()">Print Receipt</button>
+
+    <script>
+        function printOnLandiPrinter() {
+            // Check if running inside Landi Print app with AndroidBridge
+            if (typeof window.AndroidBridge !== 'undefined' && window.AndroidBridge.printReceipt) {
+                const receiptContent = `
+================================
+YOUR STORE NAME
+================================
+Order #12345
+Item 1        $10.00
+Item 2        $5.00
+--------------------------------
+Total         $15.00
+================================
+Thank you!
+                `;
+                window.AndroidBridge.printReceipt(receiptContent);
+            } else {
+                alert('AndroidBridge not available - run inside Landi Print app');
+            }
+        }
+    </script>
+</body>
+</html>
