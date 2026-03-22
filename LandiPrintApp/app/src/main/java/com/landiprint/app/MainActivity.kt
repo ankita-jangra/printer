@@ -6,6 +6,8 @@ import android.os.Bundle
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
+import android.webkit.CookieManager
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -52,8 +54,20 @@ class MainActivity : AppCompatActivity() {
         })
 
         webView = findViewById(R.id.webView)
-        webView.settings.javaScriptEnabled = true
-        webView.webViewClient = WebViewClient()
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            allowFileAccess = true
+            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        }
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, true)
+        }
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?) = false
+        }
 
         // Add JavaScript bridge - web page can call AndroidBridge.printReceipt(...)
         webView.addJavascriptInterface(PrintBridge(), "AndroidBridge")
