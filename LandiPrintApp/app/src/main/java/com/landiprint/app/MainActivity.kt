@@ -2,6 +2,8 @@ package com.landiprint.app
 
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
@@ -213,6 +215,7 @@ class MainActivity : AppCompatActivity() {
         menu.add(0, MENU_BACK, 0, "Back").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
         menu.add(0, MENU_SET_URL, 0, "Set URL").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         menu.add(0, MENU_PRINT_PAGE, 0, "Print current page").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        menu.add(0, MENU_PRINT_IMAGE, 0, "Print as image").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         return true
     }
 
@@ -228,6 +231,10 @@ class MainActivity : AppCompatActivity() {
             }
             MENU_PRINT_PAGE -> {
                 triggerPrintFromPage()
+                return true
+            }
+            MENU_PRINT_IMAGE -> {
+                printAsImage()
                 return true
             }
         }
@@ -323,11 +330,45 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun printAsImage() {
+        if (!omniConnected) {
+            Toast.makeText(this, "Printer not ready - wait a moment", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val w = webView.width
+        val h = webView.height
+        if (w <= 0 || h <= 0) {
+            Toast.makeText(this, "Nothing to capture", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        webView.draw(canvas)
+        val openSuccess = printerHelper.openPrinter()
+        if (!openSuccess) {
+            Toast.makeText(this, "Printer error - check OmniDriver is installed", Toast.LENGTH_LONG).show()
+            bitmap.recycle()
+            return
+        }
+        printerHelper.printBitmap(bitmap) { success, errorCode ->
+            runOnUiThread {
+                bitmap.recycle()
+                printerHelper.closePrinter()
+                when {
+                    success -> Toast.makeText(this, "Printed", Toast.LENGTH_SHORT).show()
+                    errorCode != null -> Toast.makeText(this, "Image print failed (code $errorCode). Try Print current page.", Toast.LENGTH_LONG).show()
+                    else -> Toast.makeText(this, "Image print not supported. Try Print current page.", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "MainActivity"
         private const val MENU_BACK = 0
         private const val MENU_SET_URL = 1
         private const val MENU_PRINT_PAGE = 2
+        private const val MENU_PRINT_IMAGE = 3
     }
 
     override fun onPause() {
@@ -359,7 +400,7 @@ class MainActivity : AppCompatActivity() {
                 if (!text.isNullOrBlank()) {
                     printReceipt(text)
                 } else if (isRetry) {
-                    Toast.makeText(this@MainActivity, "Nothing to print", Toast.LENGTH_SHORT).show()
+                    printAsImage()
                 } else {
                     webView.postDelayed({ runExtractionAndPrint(isRetry = true) }, 600)
                 }

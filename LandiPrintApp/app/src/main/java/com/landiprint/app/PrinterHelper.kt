@@ -1,5 +1,6 @@
 package com.landiprint.app
 
+import android.graphics.Bitmap
 import android.os.Bundle
 import android.util.Log
 // OmniDriver SDK - xsuite-omnidriver-api AAR
@@ -74,6 +75,58 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
             onResult(false, null)
         } catch (e: Exception) {
             Log.e(TAG, "Print error", e)
+            onResult(false, null)
+        }
+    }
+
+    /**
+     * Print bitmap image. OmniDriver may support addImage(BitmapWrapper, int, int) or similar.
+     * Scales image to receipt width (384px typical) and tries to print.
+     */
+    fun printBitmap(bitmap: Bitmap, onResult: (success: Boolean, errorCode: Int?) -> Unit) {
+        if (printer == null && !openPrinter()) {
+            onResult(false, null)
+            return
+        }
+        val p = printer ?: run { onResult(false, null); return }
+        try {
+            val receiptWidth = 384
+            val scale = receiptWidth.toFloat() / bitmap.width
+            val scaled = Bitmap.createScaledBitmap(
+                bitmap,
+                receiptWidth,
+                (bitmap.height * scale).toInt().coerceAtLeast(1),
+                true
+            )
+            try {
+                p.javaClass.getMethod("addImage", Bitmap::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .invoke(p, scaled, 0, 0)
+            } catch (e: NoSuchMethodException) {
+                try {
+                    val bitmapWrapperClass = Class.forName("com.sdksuite.omnidriver.aidl.type.BitmapWrapper")
+                    val bw = bitmapWrapperClass.getConstructor(Bitmap::class.java).newInstance(scaled)
+                    p.javaClass.getMethod("addImage", bitmapWrapperClass, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                        .invoke(p, bw, 0, 0)
+                } catch (e2: Exception) {
+                    Log.e(TAG, "addImage not found", e2)
+                    onResult(false, null)
+                    return
+                }
+            }
+            if (scaled != bitmap) scaled.recycle()
+            p.cutPaper()
+            p.startPrint(object : com.sdksuite.omnidriver.api.OnPrintListener {
+                override fun onSuccess() {
+                    Log.d(TAG, "Print image onSuccess")
+                    onResult(true, null)
+                }
+                override fun onFail(error: Int) {
+                    Log.e(TAG, "Print image onFail: $error")
+                    onResult(false, error)
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "Print bitmap error", e)
             onResult(false, null)
         }
     }
