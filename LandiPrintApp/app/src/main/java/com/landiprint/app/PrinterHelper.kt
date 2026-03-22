@@ -28,7 +28,10 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
             Log.d(TAG, "Printer opened")
             true
         } catch (e: OmniDriverException) {
-            Log.e(TAG, "OmniDriver error (service not found? Not a Landi C20?)", e)
+            Log.e(TAG, "OmniDriver error (service not bound? Reconnect to service)", e)
+            false
+        } catch (e: PrinterException) {
+            Log.e(TAG, "openDevice error: ${e.message}", e)
             false
         } catch (e: Exception) {
             Log.e(TAG, "Printer open error", e)
@@ -57,8 +60,16 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
             return
         }
         try {
-            // Use default font (0,0) - larger font caused only one line to print
-            p.addText(text, 0, 0)
+            // Add text line-by-line; some thermal APIs buffer only one line per addText call
+            val lines = text.replace("\r\n", "\n").replace('\r', '\n').split('\n')
+            for (line in lines) {
+                val trimmed = line.trim()
+                if (trimmed.isNotEmpty()) {
+                    p.addText(trimmed, 0, 0)
+                } else {
+                    p.addText(" ", 0, 0) // blank line
+                }
+            }
             p.cutPaper()
             p.startPrint(object : com.sdksuite.omnidriver.api.OnPrintListener {
                 override fun onSuccess() {
