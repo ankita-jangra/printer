@@ -5,6 +5,8 @@ import android.util.Log
 // OmniDriver SDK - xsuite-omnidriver-api AAR
 import com.sdksuite.omnidriver.OmniDriver
 import com.sdksuite.omnidriver.api.OmniDriverException
+import com.sdksuite.omnidriver.aidl.printer.ASCSize
+import com.sdksuite.omnidriver.aidl.printer.HZSize
 import com.sdksuite.omnidriver.api.Printer
 import com.sdksuite.omnidriver.api.PrinterException
 
@@ -56,7 +58,9 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
             return
         }
         try {
-            p.addText(text, 0, 0)
+            // Use larger font: ASCSize.DOT32x12=6, HZSize.DOT32x24=4 (0,0 = smallest)
+            p.addText(text, ASCSize.DOT32x12, HZSize.DOT32x24)
+            p.cutPaper()
             p.startPrint(object : com.sdksuite.omnidriver.api.OnPrintListener {
                 override fun onSuccess() {
                     Log.d(TAG, "Print onSuccess")
