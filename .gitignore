@@ -3,7 +3,7 @@
 .gradle/
 build/
 local.properties
-*.apk
+# APK in releases/ is kept for download; build output excluded via build/
 *.ap_
 *.aab
 
