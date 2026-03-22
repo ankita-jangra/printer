@@ -67,6 +67,10 @@ class MainActivity : AppCompatActivity() {
         }
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?) = false
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                injectPrintInterceptor()
+            }
         }
 
         // Add JavaScript bridge - web page can call AndroidBridge.printReceipt(...)
@@ -82,17 +86,84 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl(url)
     }
 
+    private fun injectPrintInterceptor() {
+        val script = """
+            (function() {
+                if (window._printIntercepted) return;
+                window._printIntercepted = true;
+                var origPrint = window.print;
+                window.print = function() {
+                    if (typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
+                        var sel = '.modal, .modal-body, .print-area, .receipt, .bill-content, .invoice, [class*="bill"], [class*="invoice"]';
+                        var text = (document.body.innerText || document.body.textContent || '').trim();
+                        for (var s of sel.split(', ')) {
+                            var el = document.querySelector(s.trim());
+                            if (el) {
+                                var t = (el.innerText || el.textContent || '').trim();
+                                if (t.length > 50) { text = t; break; }
+                            }
+                        }
+                        if (text && text.trim().length > 0) {
+                            AndroidBridge.printReceipt(text.trim());
+                        } else {
+                            AndroidBridge.printReceipt(document.body.innerText || document.body.textContent || 'No content');
+                        }
+                    } else if (origPrint) {
+                        origPrint.call(window);
+                    }
+                };
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(script, null)
+    }
+
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menu.add(0, MENU_SET_URL, 0, "Set URL").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        menu.add(0, MENU_PRINT_PAGE, 0, "Print current page").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         return true
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        if (item.itemId == MENU_SET_URL) {
-            showSetUrlDialog()
-            return true
+        when (item.itemId) {
+            MENU_SET_URL -> {
+                showSetUrlDialog()
+                return true
+            }
+            MENU_PRINT_PAGE -> {
+                triggerPrintFromPage()
+                return true
+            }
         }
         return super.onOptionsItemSelected(item)
+    }
+
+    private fun triggerPrintFromPage() {
+        val script = """
+            (function() {
+                var selectors = '.modal, .modal-body, [role=dialog], .print-area, .receipt, #receipt, .bill-content, .invoice, [class*="bill"], [class*="Bill"], [class*="invoice"], [class*="Invoice"], [id*="bill"], [id*="invoice"], .voucher, .main-content, #content';
+                var parts = selectors.split(', ');
+                for (var i = 0; i < parts.length; i++) {
+                    try {
+                        var el = document.querySelector(parts[i].trim());
+                        if (el) {
+                            var t = (el.innerText || el.textContent || '').trim();
+                            if (t.length > 50) return t;
+                        }
+                    } catch(e) {}
+                }
+                return (document.body.innerText || document.body.textContent || '').trim();
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(script) { result ->
+            runOnUiThread {
+                val content = result?.trim('"')?.replace("\\n", "\n")?.replace("\\\"", "\"")?.trim() ?: ""
+                if (content.isNotBlank()) {
+                    PrintBridge().printReceipt(content)
+                } else {
+                    Toast.makeText(this, "No content to print", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
     private fun showSetUrlDialog() {
@@ -125,6 +196,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val MENU_SET_URL = 1
+        private const val MENU_PRINT_PAGE = 2
     }
 
     override fun onDestroy() {
