@@ -1,20 +1,29 @@
 package com.landiprint.app
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.SharedPreferences
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.util.Log
+import android.view.View
 import android.view.Menu
 import android.view.MenuItem
 import android.webkit.CookieManager
+import android.webkit.DownloadListener
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.EditText
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.sdksuite.omnidriver.OmniDriver
+import java.net.HttpURLConnection
+import java.net.URL
 import com.sdksuite.omnidriver.OmniConnection
 
 class MainActivity : AppCompatActivity() {
@@ -54,6 +63,9 @@ class MainActivity : AppCompatActivity() {
         })
 
         webView = findViewById(R.id.webView)
+        findViewById<Button>(R.id.btnBack).setOnClickListener {
+            if (webView.canGoBack()) webView.goBack()
+        }
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -70,8 +82,60 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 injectPrintInterceptor()
+                findViewById<Button>(R.id.btnBack).visibility = if (webView.canGoBack()) View.VISIBLE else View.GONE
             }
         }
+
+        // Intercept TXT downloads and print; other downloads go to DownloadManager
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            if ((mimeType?.contains("text/plain") == true || url.contains(".txt") || (contentDisposition?.contains(".txt") == true))
+                && (url.startsWith("http://") || url.startsWith("https://"))
+            ) {
+                Thread {
+                    try {
+                        val conn = URL(url).openConnection() as HttpURLConnection
+                        conn.requestMethod = "GET"
+                        conn.setRequestProperty("User-Agent", userAgent)
+                        val cookie = CookieManager.getInstance().getCookie(url)
+                        if (!cookie.isNullOrEmpty()) conn.setRequestProperty("Cookie", cookie)
+                        conn.connect()
+                        val text = conn.inputStream.bufferedReader().readText()
+                        conn.disconnect()
+                        runOnUiThread {
+                            if (text.isNotBlank()) PrintBridge().printReceipt(text)
+                            else Toast.makeText(this, "Downloaded file is empty", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Fetch failed", e)
+                        runOnUiThread { Toast.makeText(this, "Could not get file to print", Toast.LENGTH_SHORT).show() }
+                    }
+                }.start()
+            } else if (url.startsWith("http://") || url.startsWith("https://")) {
+                try {
+                    val fileName = contentDisposition?.substringAfter("filename=")?.trim('"', '\'', ';')?.trim()
+                        ?: url.substringAfterLast("/").takeIf { it.contains(".") } ?: "download"
+                    val req = DownloadManager.Request(Uri.parse(url)).apply {
+                        setMimeType(mimeType)
+                        addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                    }
+                    (getSystemService(android.content.Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+                    Toast.makeText(this, "Downloading...", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Log.e(TAG, "DownloadManager failed", e)
+                    Toast.makeText(this, "Download failed", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        // Handle Android back: go back in WebView history when possible
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (webView.canGoBack()) webView.goBack()
+                else finish()
+            }
+        })
 
         // Add JavaScript bridge - web page can call AndroidBridge.printReceipt(...)
         webView.addJavascriptInterface(PrintBridge(), "AndroidBridge")
@@ -118,6 +182,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menu.add(0, MENU_BACK, 0, "Back").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
         menu.add(0, MENU_SET_URL, 0, "Set URL").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         menu.add(0, MENU_PRINT_PAGE, 0, "Print current page").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         return true
@@ -125,6 +190,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         when (item.itemId) {
+            MENU_BACK -> {
+                if (webView.canGoBack()) webView.goBack() else Toast.makeText(this, "No page to go back to", Toast.LENGTH_SHORT).show()
+                return true
+            }
             MENU_SET_URL -> {
                 showSetUrlDialog()
                 return true
@@ -138,32 +207,36 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun triggerPrintFromPage() {
+        // Use direct AndroidBridge.printReceipt() call to avoid evaluateJavascript encoding issues with long text
         val script = """
             (function() {
-                var selectors = '.modal, .modal-body, [role=dialog], .print-area, .receipt, #receipt, .bill-content, .invoice, [class*="bill"], [class*="Bill"], [class*="invoice"], [class*="Invoice"], [id*="bill"], [id*="invoice"], .voucher, .main-content, #content';
+                var text = '';
+                var selectors = '.modal, .modal-body, [role=dialog], .print-area, .receipt, #receipt, .bill-content, .invoice, [class*="bill"], [class*="Bill"], [class*="invoice"], [class*="Invoice"], [id*="bill"], [id*="invoice"], .voucher, .main-content, #content, main, article, .print-view, pre, #app, #root';
                 var parts = selectors.split(', ');
                 for (var i = 0; i < parts.length; i++) {
                     try {
                         var el = document.querySelector(parts[i].trim());
                         if (el) {
                             var t = (el.innerText || el.textContent || '').trim();
-                            if (t.length > 50) return t;
+                            if (t.length > 50) { text = t; break; }
                         }
                     } catch(e) {}
                 }
-                return (document.body.innerText || document.body.textContent || '').trim();
+                if (!text) text = (document.body.innerText || document.body.textContent || '').trim();
+                if (!text && document.querySelectorAll('iframe').length > 0) {
+                    try {
+                        var ifr = document.querySelector('iframe');
+                        if (ifr && ifr.contentDocument) {
+                            text = (ifr.contentDocument.body.innerText || ifr.contentDocument.body.textContent || '').trim();
+                        }
+                    } catch(e) {}
+                }
+                if (typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
+                    AndroidBridge.printReceipt(text || '');
+                }
             })();
         """.trimIndent()
-        webView.evaluateJavascript(script) { result ->
-            runOnUiThread {
-                val content = result?.trim('"')?.replace("\\n", "\n")?.replace("\\\"", "\"")?.trim() ?: ""
-                if (content.isNotBlank()) {
-                    PrintBridge().printReceipt(content)
-                } else {
-                    Toast.makeText(this, "No content to print", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
+        webView.evaluateJavascript(script, null)
     }
 
     private fun showSetUrlDialog() {
@@ -195,6 +268,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+        private const val MENU_BACK = 0
         private const val MENU_SET_URL = 1
         private const val MENU_PRINT_PAGE = 2
     }
