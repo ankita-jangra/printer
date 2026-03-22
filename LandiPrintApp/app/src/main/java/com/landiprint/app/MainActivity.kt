@@ -6,6 +6,8 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.view.Menu
@@ -36,6 +38,21 @@ class MainActivity : AppCompatActivity() {
 
     private val defaultUrl = "file:///android_asset/index.html"
     private val prefsKeyUrl = "webview_url"
+    private val keepAliveIntervalMs = 4 * 60 * 1000L // 4 minutes
+    private val keepAliveHandler = Handler(Looper.getMainLooper())
+    private val keepAliveRunnable = object : Runnable {
+        override fun run() {
+            val url = webView.url ?: return
+            if (url.startsWith("https://") || url.startsWith("http://")) {
+                webView.evaluateJavascript(
+                    "fetch(location.origin,{method:'HEAD',credentials:'same-origin'}).catch(function(){})",
+                    null
+                )
+                Log.d(TAG, "Keep-alive ping")
+            }
+            keepAliveHandler.postDelayed(this, keepAliveIntervalMs)
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,6 +89,7 @@ class MainActivity : AppCompatActivity() {
             databaseEnabled = true
             allowFileAccess = true
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            cacheMode = WebSettings.LOAD_DEFAULT
         }
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
@@ -83,6 +101,10 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 injectPrintInterceptor()
                 findViewById<Button>(R.id.btnBack).visibility = if (webView.canGoBack()) View.VISIBLE else View.GONE
+                if (url != null && (url.startsWith("https://") || url.startsWith("http://"))) {
+                    keepAliveHandler.removeCallbacks(keepAliveRunnable)
+                    keepAliveHandler.postDelayed(keepAliveRunnable, keepAliveIntervalMs)
+                }
             }
         }
 
@@ -158,8 +180,8 @@ class MainActivity : AppCompatActivity() {
                 var origPrint = window.print;
                 window.print = function() {
                     if (typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
-                        var sel = '.modal, .modal-body, .print-area, .receipt, .bill-content, .invoice, [class*="bill"], [class*="invoice"]';
                         var text = (document.body.innerText || document.body.textContent || '').trim();
+                        var sel = '.modal, .modal-body, .print-area, .receipt, .bill-content, .invoice, [class*="bill"], [class*="invoice"]';
                         for (var s of sel.split(', ')) {
                             var el = document.querySelector(s.trim());
                             if (el) {
@@ -167,14 +189,20 @@ class MainActivity : AppCompatActivity() {
                                 if (t.length > 50) { text = t; break; }
                             }
                         }
-                        if (text && text.trim().length > 0) {
-                            AndroidBridge.printReceipt(text.trim());
-                        } else {
-                            AndroidBridge.printReceipt(document.body.innerText || document.body.textContent || 'No content');
-                        }
-                    } else if (origPrint) {
-                        origPrint.call(window);
+                        if (text) AndroidBridge.printReceipt(text); else AndroidBridge.printReceipt(document.body.innerText || document.body.textContent || '');
+                    } else if (origPrint) origPrint.call(window);
+                };
+                var origCreateObjectURL = URL.createObjectURL;
+                URL.createObjectURL = function(blob) {
+                    if (blob && blob.size > 50 && blob.type && blob.type.indexOf('text') >= 0 && typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
+                        var r = new FileReader();
+                        r.onload = function() {
+                            var t = (r.result || '').trim();
+                            if (t.length > 50) AndroidBridge.printReceipt(t);
+                        };
+                        r.readAsText(blob);
                     }
+                    return origCreateObjectURL.apply(URL, arguments);
                 };
             })();
         """.trimIndent()
@@ -207,35 +235,64 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun triggerPrintFromPage() {
-        // Use direct AndroidBridge.printReceipt() call to avoid evaluateJavascript encoding issues with long text
+        runExtractionAndPrint(isRetry = false)
+    }
+
+    private fun runExtractionAndPrint(isRetry: Boolean) {
         val script = """
             (function() {
+                function getText(el) {
+                    if (!el) return '';
+                    try {
+                        var t = (el.innerText || el.textContent || '').trim();
+                        if (t) return t;
+                        if (el.shadowRoot) return getText(el.shadowRoot);
+                        return '';
+                    } catch(e) { return ''; }
+                }
+                function getDocText(doc) {
+                    if (!doc || !doc.body) return '';
+                    return getText(doc.body) || getText(doc.documentElement) || '';
+                }
                 var text = '';
-                var selectors = '.modal, .modal-body, [role=dialog], .print-area, .receipt, #receipt, .bill-content, .invoice, [class*="bill"], [class*="Bill"], [class*="invoice"], [class*="Invoice"], [id*="bill"], [id*="invoice"], .voucher, .main-content, #content, main, article, .print-view, pre, #app, #root';
-                var parts = selectors.split(', ');
-                for (var i = 0; i < parts.length; i++) {
-                    try {
-                        var el = document.querySelector(parts[i].trim());
-                        if (el) {
-                            var t = (el.innerText || el.textContent || '').trim();
-                            if (t.length > 50) { text = t; break; }
-                        }
-                    } catch(e) {}
+                var doc = document;
+                text = getDocText(doc);
+                if (!text || text.length < 30) {
+                    var iframes = doc.querySelectorAll('iframe');
+                    for (var i = 0; i < iframes.length; i++) {
+                        try {
+                            var fdoc = iframes[i].contentDocument || iframes[i].contentWindow?.document;
+                            var ft = getDocText(fdoc);
+                            if (ft && ft.length > (text || '').length) text = ft;
+                        } catch(e) {}
+                    }
                 }
-                if (!text) text = (document.body.innerText || document.body.textContent || '').trim();
-                if (!text && document.querySelectorAll('iframe').length > 0) {
-                    try {
-                        var ifr = document.querySelector('iframe');
-                        if (ifr && ifr.contentDocument) {
-                            text = (ifr.contentDocument.body.innerText || ifr.contentDocument.body.textContent || '').trim();
-                        }
-                    } catch(e) {}
+                if (!text || text.length < 30) {
+                    var sel = '[class*="receipt"],[class*="bill"],[class*="invoice"],[class*="print"],[class*="view"],main,article,#content,.content';
+                    var all = doc.querySelectorAll(sel);
+                    for (var i = 0; i < all.length; i++) {
+                        var t = getText(all[i]);
+                        if (t && t.length > 50 && t.length > (text || '').length) text = t;
+                    }
                 }
-                if (typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
-                    AndroidBridge.printReceipt(text || '');
+                if (!text || text.length < 30) {
+                    var walk = function(n) {
+                        if (!n || n.nodeType !== 1) return '';
+                        var t = getText(n);
+                        if (t && t.length > 100) return t;
+                        for (var c = n.firstChild; c; c = c.nextSibling) {
+                            var ct = walk(c);
+                            if (ct && ct.length > (t || '').length) t = ct;
+                        }
+                        return t || '';
+                    };
+                    text = walk(doc.body) || text;
+                }
+                if (typeof AndroidBridge !== 'undefined' && AndroidBridge.reportExtractionResult) {
+                    AndroidBridge.reportExtractionResult((text || '').trim(), $isRetry);
                 }
             })();
-        """.trimIndent()
+        """.trimIndent().replace("$isRetry", if (isRetry) "true" else "false")
         webView.evaluateJavascript(script, null)
     }
 
@@ -273,13 +330,41 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_PRINT_PAGE = 2
     }
 
+    override fun onPause() {
+        super.onPause()
+        keepAliveHandler.removeCallbacks(keepAliveRunnable)
+        CookieManager.getInstance().flush()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized && (webView.url?.startsWith("http") == true)) {
+            keepAliveHandler.postDelayed(keepAliveRunnable, keepAliveIntervalMs)
+        }
+    }
+
     override fun onDestroy() {
+        keepAliveHandler.removeCallbacks(keepAliveRunnable)
+        CookieManager.getInstance().flush()
         printerHelper.closePrinter()
         try { omniDriver.destroy() } catch (e: Exception) { Log.e(TAG, "Destroy error", e) }
         super.onDestroy()
     }
 
     inner class PrintBridge {
+
+        @android.webkit.JavascriptInterface
+        fun reportExtractionResult(text: String?, isRetry: Boolean) {
+            runOnUiThread {
+                if (!text.isNullOrBlank()) {
+                    printReceipt(text)
+                } else if (isRetry) {
+                    Toast.makeText(this@MainActivity, "Nothing to print", Toast.LENGTH_SHORT).show()
+                } else {
+                    webView.postDelayed({ runExtractionAndPrint(isRetry = true) }, 600)
+                }
+            }
+        }
 
         @android.webkit.JavascriptInterface
         fun printReceipt(htmlOrText: String?) {
