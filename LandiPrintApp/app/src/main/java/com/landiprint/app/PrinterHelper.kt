@@ -1,6 +1,10 @@
 package com.landiprint.app
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.os.Bundle
 import android.util.Log
 // OmniDriver SDK - xsuite-omnidriver-api AAR
@@ -60,16 +64,8 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
             return
         }
         try {
-            // Add text line-by-line; some thermal APIs buffer only one line per addText call
-            val lines = text.replace("\r\n", "\n").replace('\r', '\n').split('\n')
-            for (line in lines) {
-                val trimmed = line.trim()
-                if (trimmed.isNotEmpty()) {
-                    p.addText(trimmed, 0, 0)
-                } else {
-                    p.addText(" ", 0, 0) // blank line
-                }
-            }
+            // Single addText with full content - OmniDriver buffers and prints all
+            p.addText(text, 0, 0)
             p.cutPaper()
             p.startPrint(object : com.sdksuite.omnidriver.api.OnPrintListener {
                 override fun onSuccess() {
@@ -91,8 +87,29 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
     }
 
     /**
-     * Print bitmap image. OmniDriver may support addImage(BitmapWrapper, int, int) or similar.
-     * Scales image to receipt width (384px typical) and tries to print.
+     * Convert to thermal-ready format: scale to receipt width, grayscale, high contrast.
+     * Thermal printers often need monochrome-friendly images.
+     */
+    fun prepareForThermal(source: Bitmap, receiptWidth: Int = 384): Bitmap {
+        val scale = receiptWidth.toFloat() / source.width
+        val targetH = (source.height * scale).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(source, receiptWidth, targetH, true)
+        if (scaled == source) return scaled
+        val gray = Bitmap.createBitmap(receiptWidth, targetH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(gray)
+        val paint = Paint().apply {
+            colorFilter = ColorMatrixColorFilter(ColorMatrix().apply {
+                setSaturation(0f)
+                setScale(1.2f, 1.2f, 1.2f, 1f)
+            })
+        }
+        canvas.drawBitmap(scaled, 0f, 0f, paint)
+        if (scaled != source) scaled.recycle()
+        return gray
+    }
+
+    /**
+     * Print bitmap - exact bill as shown. Uses addImage if supported.
      */
     fun printBitmap(bitmap: Bitmap, onResult: (success: Boolean, errorCode: Int?) -> Unit) {
         if (printer == null && !openPrinter()) {
@@ -101,21 +118,14 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
         }
         val p = printer ?: run { onResult(false, null); return }
         try {
-            val receiptWidth = 384
-            val scale = receiptWidth.toFloat() / bitmap.width
-            val scaled = Bitmap.createScaledBitmap(
-                bitmap,
-                receiptWidth,
-                (bitmap.height * scale).toInt().coerceAtLeast(1),
-                true
-            )
+            val thermal = prepareForThermal(bitmap)
             try {
                 p.javaClass.getMethod("addImage", Bitmap::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                    .invoke(p, scaled, 0, 0)
+                    .invoke(p, thermal, 0, 0)
             } catch (e: NoSuchMethodException) {
                 try {
                     val bitmapWrapperClass = Class.forName("com.sdksuite.omnidriver.aidl.type.BitmapWrapper")
-                    val bw = bitmapWrapperClass.getConstructor(Bitmap::class.java).newInstance(scaled)
+                    val bw = bitmapWrapperClass.getConstructor(Bitmap::class.java).newInstance(thermal)
                     p.javaClass.getMethod("addImage", bitmapWrapperClass, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                         .invoke(p, bw, 0, 0)
                 } catch (e2: Exception) {
@@ -124,7 +134,7 @@ class PrinterHelper(private val omniDriver: OmniDriver) {
                     return
                 }
             }
-            if (scaled != bitmap) scaled.recycle()
+            if (thermal != bitmap) thermal.recycle()
             p.cutPaper()
             p.startPrint(object : com.sdksuite.omnidriver.api.OnPrintListener {
                 override fun onSuccess() {

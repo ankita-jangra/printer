@@ -3,6 +3,9 @@ package com.landiprint.app
 import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -14,6 +17,7 @@ import android.view.Menu
 import android.view.MenuItem
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -23,6 +27,9 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.sdksuite.omnidriver.OmniDriver
 import java.net.HttpURLConnection
 import java.net.URL
@@ -83,6 +90,10 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnBack).setOnClickListener {
             if (webView.canGoBack()) webView.goBack()
         }
+        findViewById<Button>(R.id.btnPrint).setOnClickListener {
+            Toast.makeText(this, "Printing...", Toast.LENGTH_SHORT).show()
+            triggerPrintFromPage()
+        }
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -96,7 +107,31 @@ class MainActivity : AppCompatActivity() {
             setAcceptThirdPartyCookies(webView, true)
         }
         webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, url: String?) = false
+            private fun handleTxtUrl(url: String): Boolean {
+                if (!url.endsWith(".txt") || !url.startsWith("http")) return false
+                Toast.makeText(this@MainActivity, "Printing...", Toast.LENGTH_SHORT).show()
+                Thread {
+                    try {
+                        val conn = URL(url).openConnection() as HttpURLConnection
+                        conn.requestMethod = "GET"
+                        conn.setRequestProperty("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                        conn.connect()
+                        val text = conn.inputStream.bufferedReader().readText()
+                        conn.disconnect()
+                        if (text.length > 50) {
+                            runOnUiThread { PrintBridge().printReceipt(text) }
+                        }
+                    } catch (e: Exception) { Log.e(TAG, "TXT fetch failed", e) }
+                }.start()
+                return true
+            }
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?) =
+                url != null && handleTxtUrl(url)
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+                return handleTxtUrl(url)
+            }
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 injectPrintInterceptor()
@@ -180,27 +215,31 @@ class MainActivity : AppCompatActivity() {
                 var origPrint = window.print;
                 window.print = function() {
                     if (typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
-                        var text = (document.body.innerText || document.body.textContent || '').trim();
+                        var bodyText = (document.body.innerText || document.body.textContent || '').trim();
+                        var text = bodyText;
                         var sel = '.modal, .modal-body, .print-area, .receipt, .bill-content, .invoice, [class*="bill"], [class*="invoice"]';
                         for (var s of sel.split(', ')) {
                             var nodes = document.querySelectorAll(s.trim());
                             for (var i = 0; i < nodes.length; i++) {
                                 var t = (nodes[i].innerText || nodes[i].textContent || '').trim();
-                                if (t.length > text.length) text = t;
+                                if (t.length > text.length && t.length > 100) text = t;
                             }
                         }
-                        if (text) AndroidBridge.printReceipt(text); else AndroidBridge.printReceipt(document.body.innerText || document.body.textContent || '');
+                        AndroidBridge.printReceipt(text || bodyText);
                     } else if (origPrint) origPrint.call(window);
                 };
                 var origCreateObjectURL = URL.createObjectURL;
                 URL.createObjectURL = function(blob) {
-                    if (blob && blob.size > 50 && blob.type && blob.type.indexOf('text') >= 0 && typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
-                        var r = new FileReader();
-                        r.onload = function() {
-                            var t = (r.result || '').trim();
-                            if (t.length > 50) AndroidBridge.printReceipt(t);
-                        };
-                        r.readAsText(blob);
+                    if (blob && blob.size > 80 && typeof AndroidBridge !== 'undefined' && AndroidBridge.printReceipt) {
+                        var isText = !blob.type || blob.type.indexOf('text') >= 0 || blob.type.indexOf('json') >= 0 || blob.type === '';
+                        if (isText) {
+                            var r = new FileReader();
+                            r.onload = function() {
+                                var t = (r.result || '').trim();
+                                if (t.length > 80) AndroidBridge.printReceipt(t);
+                            };
+                            r.readAsText(blob);
+                        }
                     }
                     return origCreateObjectURL.apply(URL, arguments);
                 };
@@ -323,6 +362,105 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    /**
+     * Print exact bill shown: fetches original image if URL is .jpg/.png, else captures WebView.
+     * Tries image print first (pixel-perfect), falls back to OCR if printer doesn't support images.
+     */
+    private fun printExactBill() {
+        val url = webView.url ?: ""
+        val isImageUrl = url.endsWith(".jpg", true) || url.endsWith(".jpeg", true) ||
+            url.endsWith(".png", true) || url.endsWith(".webp", true)
+
+        if (isImageUrl && url.startsWith("http")) {
+            Toast.makeText(this, "Printing exact bill...", Toast.LENGTH_SHORT).show()
+            Thread {
+                try {
+                    val conn = URL(url).openConnection() as HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.setRequestProperty("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                    conn.connect()
+                    val bytes = conn.inputStream.readBytes()
+                    conn.disconnect()
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        ?: throw Exception("Could not decode image")
+                    runOnUiThread { tryPrintExactThenOcr(bitmap) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Fetch bill image failed", e)
+                    runOnUiThread { captureAndPrintFromView() }
+                }
+            }.start()
+        } else {
+            captureAndPrintFromView()
+        }
+    }
+
+    private fun captureAndPrintFromView() {
+        Toast.makeText(this, "Capturing bill...", Toast.LENGTH_SHORT).show()
+        val w = webView.width
+        val h = webView.height
+        if (w <= 0 || h <= 0) {
+            Toast.makeText(this, "Nothing to capture", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        webView.draw(canvas)
+        tryPrintExactThenOcr(bitmap)
+    }
+
+    private fun tryPrintExactThenOcr(bitmap: Bitmap) {
+        if (!omniConnected) {
+            bitmap.recycle()
+            Toast.makeText(this, "Printer not ready", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val openSuccess = printerHelper.openPrinter()
+        if (!openSuccess) {
+            bitmap.recycle()
+            Toast.makeText(this, "Printer error", Toast.LENGTH_SHORT).show()
+            return
+        }
+        printerHelper.printBitmap(bitmap) { success, _ ->
+            runOnUiThread {
+                printerHelper.closePrinter()
+                if (success) {
+                    bitmap.recycle()
+                    Toast.makeText(this, "Printed", Toast.LENGTH_SHORT).show()
+                } else {
+                    runOcrFallback(bitmap)
+                }
+            }
+        }
+    }
+
+    private fun runOcrFallback(bitmap: Bitmap) {
+        Toast.makeText(this, "Reading bill text...", Toast.LENGTH_SHORT).show()
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val image = InputImage.fromBitmap(bitmap, 0)
+        recognizer.process(image)
+            .addOnSuccessListener { result ->
+                val text = result.text.trim()
+                runOnUiThread {
+                    bitmap.recycle()
+                    if (text.length >= 30) {
+                        printReceiptFromBridge(text)
+                    } else {
+                        Toast.makeText(this, "Could not read bill. Use Print from bill list.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            .addOnFailureListener {
+                runOnUiThread {
+                    bitmap.recycle()
+                    Toast.makeText(this, "Could not read bill.", Toast.LENGTH_LONG).show()
+                }
+            }
+    }
+
+    private fun printReceiptFromBridge(text: String) {
+        PrintBridge().printReceipt(text)
+    }
+
     companion object {
         private const val TAG = "MainActivity"
         private const val MENU_BACK = 0
@@ -356,10 +494,10 @@ class MainActivity : AppCompatActivity() {
         @android.webkit.JavascriptInterface
         fun reportExtractionResult(text: String?, isRetry: Boolean) {
             runOnUiThread {
-                if (!text.isNullOrBlank()) {
+                if (!text.isNullOrBlank() && text.length >= 50) {
                     printReceipt(text)
                 } else if (isRetry) {
-                    Toast.makeText(this@MainActivity, "Bill is shown as image. This printer supports text only. Use Print button from bill list.", Toast.LENGTH_LONG).show()
+                    printExactBill()
                 } else {
                     webView.postDelayed({ runExtractionAndPrint(isRetry = true) }, 600)
                 }
@@ -372,6 +510,10 @@ class MainActivity : AppCompatActivity() {
                 // Check for null or empty content
                 if (htmlOrText.isNullOrBlank()) {
                     Toast.makeText(this@MainActivity, "Nothing to print", Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                if (htmlOrText.length < 50) {
+                    Toast.makeText(this@MainActivity, "Content too short (${htmlOrText.length} chars). Ensure bill is visible.", Toast.LENGTH_LONG).show()
                     return@runOnUiThread
                 }
                 if (!omniConnected) {
